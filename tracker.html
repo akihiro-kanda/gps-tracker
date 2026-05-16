@@ -8,16 +8,23 @@
     body { margin:0; font-family: sans-serif; }
     #map { width:100vw; height:100vh; }
     #panel {
-      position:absolute; top:10px; left:10px; z-index:1000;
-      background:#fff; padding:10px; border-radius:8px;
+      position:absolute; top:20px; right:10px; z-index:1000;
+      background:rgba(255,255,255,0.7); padding:10px; border-radius:8px;
       box-shadow: 0 2px 8px rgba(0,0,0,.2);
-      max-height: 80vh; overflow:auto; min-width: 260px;
+      max-height: 80vh; overflow:auto; min-width: 160px;
+      max-width: calc(80vw - 20px);
     }
     .row { display:flex; align-items:center; gap:8px; }
     .small { font-size: 12px; color:#444; }
     .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eee; font-size:12px; }
     .ok { background:#d9f7d9; }
     .ng { background:#ffd6d6; }
+    #devlist label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
@@ -28,13 +35,12 @@
       <label class="row"><input type="checkbox" id="trail" checked>軌跡</label>
     </div>
     <div class="row" style="margin-top:6px;">
-      <span class="small">ポーリング(ms)</span>
-      <input id="poll" value="2000" size="6">
+      <span class="small">ポーリング(S)</span>
+      <input id="poll" value="3" size="6">
+    </div>
+    <div class="row" style="margin-top:6px;">
       <span class="small">軌跡点数</span>
       <input id="trailPts" value="300" size="5">
-    </div>
-    <div class="small" style="margin-top:6px;">
-      チェックしたデバイスだけ表示（最大20台）。found=false は無視。
     </div>
     <hr>
     <div id="devlist"></div>
@@ -169,7 +175,7 @@
       const ids = selectedIds();
       if (ids.length === 0) return;
 
-      const pollMs = Number(document.getElementById("poll").value) || 2000;
+      const pollS = Number(document.getElementById("poll").value) || 3;
       const trailOn = document.getElementById("trail").checked;
       const trailPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
 
@@ -219,8 +225,8 @@
     function start() {
       stop();
       tick().catch(console.error);
-      const pollMs = Number(document.getElementById("poll").value) || 2000;
-      timer = setInterval(() => tick().catch(console.error), pollMs);
+      const pollS = Number(document.getElementById("poll").value) || 3;
+      timer = setInterval(() => tick().catch(console.error), pollS *1000);
     }
 
     function stop() {
