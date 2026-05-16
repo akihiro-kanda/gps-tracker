@@ -1,0 +1,239 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GPS Tracker (Polling, multi-device)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { margin:0; font-family: sans-serif; }
+    #map { width:100vw; height:100vh; }
+    #panel {
+      position:absolute; top:10px; left:10px; z-index:1000;
+      background:#fff; padding:10px; border-radius:8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.2);
+      max-height: 80vh; overflow:auto; min-width: 260px;
+    }
+    .row { display:flex; align-items:center; gap:8px; }
+    .small { font-size: 12px; color:#444; }
+    .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eee; font-size:12px; }
+    .ok { background:#d9f7d9; }
+    .ng { background:#ffd6d6; }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <div class="row">
+      <button id="start">開始</button>
+      <button id="stop">停止</button>
+      <label class="row"><input type="checkbox" id="trail" checked>軌跡</label>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <span class="small">ポーリング(ms)</span>
+      <input id="poll" value="2000" size="6">
+      <span class="small">軌跡点数</span>
+      <input id="trailPts" value="300" size="5">
+    </div>
+    <div class="small" style="margin-top:6px;">
+      チェックしたデバイスだけ表示（最大20台）。found=false は無視。
+    </div>
+    <hr>
+    <div id="devlist"></div>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // ====== あなたのAPI ======
+    const API_BASE = "https://fyx3533ssl.execute-api.us-east-1.amazonaws.com/prod";
+
+    // ====== 初期表示の候補デバイスID（最大20想定） ======
+    // ここは運用の登録台数に合わせて並べる
+    const DEVICE_IDS = [1,2,3,4,5,6,7,8,9,10];
+
+    // ====== Leaflet Map ======
+    const map = L.map('map').setView([34.70, 137.72], 14);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // device_id -> marker / polyline / lastTimestamp
+    const markers = new Map();
+    const trails  = new Map();
+    const lastTs  = new Map();
+
+    // e7 int -> degree
+    const e7toDeg = (v) => v / 1e7;
+
+    // ====== UI生成 ======
+    const devlist = document.getElementById("devlist");
+    for (const id of DEVICE_IDS) {
+      const div = document.createElement("div");
+      div.className = "row";
+      div.innerHTML = `
+        <label class="row" style="flex:1;">
+          <input type="checkbox" data-id="${id}">
+          ID ${id}
+        </label>
+        <span class="badge ng" id="status-${id}">unknown</span>
+      `;
+      devlist.appendChild(div);
+    }
+
+    function selectedIds() {
+      return [...document.querySelectorAll("#devlist input[type=checkbox]")]
+        .filter(x => x.checked)
+        .map(x => Number(x.dataset.id));
+    }
+
+    function setStatus(id, ok) {
+      const el = document.getElementById(`status-${id}`);
+      if (!el) return;
+      if (ok) { el.textContent = "found"; el.className = "badge ok"; }
+      else    { el.textContent = "none";  el.className = "badge ng"; }
+    }
+
+    // ====== API呼び出し ======
+    async function fetchLatest(ids) {
+      const url = `${API_BASE}/latest?ids=${encodeURIComponent(ids.join(","))}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("latest fetch failed");
+      return await r.json();
+    }
+
+    async function fetchHistory(deviceId, limit) {
+      const url = `${API_BASE}/history?device_id=${encodeURIComponent(deviceId)}&limit=${encodeURIComponent(limit)}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("history fetch failed");
+      return await r.json();
+    }
+
+    // ====== 描画ユーティリティ ======
+    function upsertMarker(p) {
+      const id = p.device_id;
+      const ll = [e7toDeg(p.lat), e7toDeg(p.lon)];
+      let m = markers.get(id);
+      if (!m) {
+        m = L.marker(ll).addTo(map);
+        markers.set(id, m);
+      } else {
+        m.setLatLng(ll);
+      }
+      m.bindPopup(
+        `ID:${id}<br>` +
+        `ts:${p.timestamp}<br>` +
+        `spd:${(p.speed/100).toFixed(2)} m/s<br>` +
+        `rssi:${p.rssi}<br>` +
+        `gw:${p.gw ?? ""}`
+      );
+      return ll;
+    }
+
+    function setTrailFromHistory(id, items) {
+      const pts = items.map(it => [e7toDeg(it.lat), e7toDeg(it.lon)]);
+      let pl = trails.get(id);
+      if (!pl) {
+        pl = L.polyline(pts, { color: "red" }).addTo(map);
+        trails.set(id, pl);
+      } else {
+        pl.setLatLngs(pts);
+      }
+    }
+
+    function appendTrailPoint(id, ll, maxPts) {
+      let pl = trails.get(id);
+      if (!pl) {
+        pl = L.polyline([ll], { color: "red" }).addTo(map);
+        trails.set(id, pl);
+        return;
+      }
+      const pts = pl.getLatLngs();
+      pts.push(L.latLng(ll[0], ll[1]));
+      if (pts.length > maxPts) pts.shift();
+      pl.setLatLngs(pts);
+    }
+
+    function clearDevice(id) {
+      const m = markers.get(id);
+      if (m) { map.removeLayer(m); markers.delete(id); }
+      const p = trails.get(id);
+      if (p) { map.removeLayer(p); trails.delete(id); }
+      lastTs.delete(id);
+      setStatus(id, false);
+    }
+
+    // ====== ポーリング本体 ======
+    let timer = null;
+
+    async function tick() {
+      const ids = selectedIds();
+      if (ids.length === 0) return;
+
+      const pollMs = Number(document.getElementById("poll").value) || 2000;
+      const trailOn = document.getElementById("trail").checked;
+      const trailPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
+
+      // 最新位置をまとめて取得
+      const latest = await fetchLatest(ids);
+
+      for (const p of latest.items) {
+        const id = p.device_id;
+
+        if (!p.found) {
+          // 存在しないデバイス：表示しない（チェックは残してもOK）
+          setStatus(id, false);
+          // 既に地図にある場合は消す
+          if (markers.has(id)) clearDevice(id);
+          continue;
+        }
+
+        setStatus(id, true);
+
+        // marker更新
+        const ll = upsertMarker(p);
+
+        // 軌跡
+        if (trailOn) {
+          if (!trails.has(id)) {
+            // 初回だけ履歴をまとめて取得して線を作る（軽量＆見た目が良い）
+            const hist = await fetchHistory(id, trailPts);
+            if (hist.items && hist.items.length > 1) {
+              setTrailFromHistory(id, hist.items);
+            } else {
+              appendTrailPoint(id, ll, trailPts);
+            }
+          } else {
+            // 2回目以降は最新点だけ追記（軽量）
+            appendTrailPoint(id, ll, trailPts);
+          }
+        }
+        lastTs.set(id, p.timestamp);
+      }
+
+      // チェック外のものは消す
+      for (const id of [...markers.keys()]) {
+        if (!ids.includes(id)) clearDevice(id);
+      }
+    }
+
+    function start() {
+      stop();
+      tick().catch(console.error);
+      const pollMs = Number(document.getElementById("poll").value) || 2000;
+      timer = setInterval(() => tick().catch(console.error), pollMs);
+    }
+
+    function stop() {
+      if (timer) clearInterval(timer);
+      timer = null;
+    }
+
+    document.getElementById("start").addEventListener("click", start);
+    document.getElementById("stop").addEventListener("click", stop);
+    devlist.addEventListener("change", () => tick().catch(console.error));
+
+    // 起動（まずは停止状態にしておき、チェックしたら開始でもOK）
+    start();
+  </script>
+</body>
+</html>
