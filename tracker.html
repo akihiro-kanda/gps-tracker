@@ -212,14 +212,26 @@
     function setTrailFromHistory(id, items) {
       const color = colorForId(id);
       const pts = items.map(it => [e7toDeg(it.lat), e7toDeg(it.lon)]);
-      let pl = trails.get(id);
-      if (!pl) {
-        pl = L.polyline(pts, { color, weight: 4, opacity: 0.85 }).addTo(map);
-        trails.set(id, pl);
-      } else {
-        pl.setLatLngs(pts);
-        pl.setStyle({ color, weight: 4, opacity: 0.85 });
+      
+      // 既存があれば消して作り直す（確実）
+      const old = trails.get(id);
+      if (old) {
+        map.removeLayer(old);
+        trails.delete(id);
       }
+      
+      const pl = L.polyline(pts, {
+        color,
+        weight: 6,        // ← 太くする
+        opacity: 1.0,     // ← 濃くする
+        lineJoin: "round",
+        lineCap: "round"
+      }).addTo(map);
+      
+      // ← これが効くことが多い：線を前面へ
+      pl.bringToFront();
+      
+      trails.set(id, pl);
     }
 
     function appendTrailPoint(id, ll, maxPts) {
