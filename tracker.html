@@ -92,7 +92,7 @@
     </div>
 
     <div class="small" style="margin-top:6px;">
-      表示データ選択(表示名はlabels.csv)
+      表示選択(ラベルはlabels.csv))
     </div>
     <hr>
     <div id="devlist"></div>
@@ -117,9 +117,6 @@
     // ====== Labels CSV (same folder as tracker.html) ======
     const LABELS_CSV_URL = "./labels.csv";
 
-    // ====== Candidate device IDs (max 20) ======
-    const DEVICE_IDS = [1,2,3,4,5,6,7,8,9,10];
-
     // ====== Color per ID ======
     const COLOR_PALETTE = [
       "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
@@ -141,6 +138,18 @@
     function displayName(id){
       const s = labelMap.get(id);
       return (s && s.trim().length) ? s.trim() : defaultLabel(id);
+    }
+
+    function escapeHtml(s){
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function getCsvIdsSorted(){
+      return [...labelMap.keys()].sort((a,b) => a - b);
     }
 
     async function loadLabelsFromCsv(url){
@@ -274,12 +283,20 @@
       }
     }
 
-    // ====== UI build ======
+    // ====== Device list (from CSV only) ======
     const devlist = document.getElementById("devlist");
 
     function renderDevList(){
       devlist.innerHTML = '';
-      for (const id of DEVICE_IDS) {
+      const ids = getCsvIdsSorted();
+      if(ids.length === 0){
+        const div = document.createElement('div');
+        div.className = 'small';
+        div.textContent = 'labels.csv にIDがありません';
+        devlist.appendChild(div);
+        return;
+      }
+      for (const id of ids) {
         const div = document.createElement("div");
         div.className = "devrow";
         div.innerHTML = `
@@ -291,14 +308,6 @@
         `;
         devlist.appendChild(div);
       }
-    }
-
-    function escapeHtml(s){
-      return String(s)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;');
     }
 
     function selectedIds() {
@@ -527,8 +536,9 @@
     document.getElementById('reloadLabels').addEventListener('click', async () => {
       await loadLabelsFromCsv(LABELS_CSV_URL);
       renderDevList();
-      await refreshSelectedHistory();
-      await tick();
+      // clear all current layers/datasets because ID list might have changed
+      for (const id of [...markers.keys()]) clearDevice(id);
+      await start();
     });
 
     devlist.addEventListener("change", () => {
