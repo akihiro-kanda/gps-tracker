@@ -23,8 +23,8 @@
       padding: 10px; border-radius: 8px;
       box-shadow: 0 2px 8px rgba(0,0,0,.2);
       max-height: 80vh; overflow: auto;
-      min-width: 160px;
-      max-width: calc(80vw - 20px);
+      min-width: 180px;
+      max-width: calc(86vw - 20px);
     }
 
     .row { display: flex; align-items: center; gap: 8px; }
@@ -34,24 +34,35 @@
     .ok { background: #d9f7d9; }
     .ng { background: #ffd6d6; }
 
-    /* device list: keep as vertical list, but make label compact */
-    #devlist .row{
+    /* device list: vertical list (no grid), compact */
+    #devlist .devrow{
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 6px;
-      margin: 2px 0;
+      margin: 3px 0;
     }
-    #devlist .row > label{
-      flex: 0 0 auto;           /* do NOT stretch */
+    #devlist .devleft{
       display: inline-flex;
       align-items: center;
-      gap: 4px;
-      white-space: nowrap;
-      font-size: 14px;
+      gap: 6px;
+      flex: 1 1 auto;
+      min-width: 0;
     }
 
-    /* Permanent ID label over marker */
+    #devlist input[type=checkbox]{
+      transform: scale(1.05);
+    }
+
+    /* Custom label input */
+    .labelInput{
+      width: 120px;
+      max-width: 42vw;
+      font-size: 13px;
+      padding: 2px 4px;
+    }
+
+    /* Permanent label over marker */
     .id-label {
       background: rgba(0,0,0,0.55);
       color: #fff;
@@ -60,6 +71,7 @@
       font-size: 12px;
       font-weight: 700;
       border: 0;
+      white-space: nowrap;
     }
   </style>
 </head>
@@ -78,7 +90,9 @@
       <input id="trailPts" value="300" size="4">
     </div>
 
-    <div class="small" style="margin-top:6px;">チェックしたIDのみ表示（最大20台）</div>
+    <div class="small" style="margin-top:6px;">
+      表示データ選択(+ラベル入力)
+    </div>
     <hr>
     <div id="devlist"></div>
   </div>
@@ -113,8 +127,65 @@
       return COLOR_PALETTE[(id - 1) % COLOR_PALETTE.length];
     }
 
+    // ====== Label map (custom text per device_id) ======
+    const LABEL_STORE_KEY = "gps_tracker_label_map_v1";
+    const labelMap = new Map(); // id -> string
+
+    function loadLabels(){
+      try{
+        const raw = localStorage.getItem(LABEL_STORE_KEY);
+        if(!raw) return;
+        const obj = JSON.parse(raw);
+        for(const [k,v] of Object.entries(obj)){
+          const id = Number(k);
+          if(Number.isFinite(id) && typeof v === 'string') labelMap.set(id, v);
+        }
+      }catch(e){
+        console.warn('loadLabels failed', e);
+      }
+    }
+
+    function saveLabels(){
+      try{
+        const obj = {};
+        for(const [id, name] of labelMap.entries()) obj[String(id)] = name;
+        localStorage.setItem(LABEL_STORE_KEY, JSON.stringify(obj));
+      }catch(e){
+        console.warn('saveLabels failed', e);
+      }
+    }
+
+    function defaultLabel(id){
+      return `ID ${id}`;
+    }
+
+    function displayName(id){
+      const s = labelMap.get(id);
+      return (s && s.trim().length) ? s.trim() : defaultLabel(id);
+    }
+
+    function setLabel(id, text){
+      const t = (text ?? '').toString().trim();
+      if(t.length === 0) labelMap.delete(id);
+      else labelMap.set(id, t);
+      saveLabels();
+      // Update marker tooltip if exists
+      const m = markers.get(id);
+      if(m && m.getTooltip && m.getTooltip()) {
+        m.setTooltipContent(displayName(id));
+      }
+      // Update chart dataset label if exists
+      const idx = findDatasetIndex(id);
+      if(idx >= 0) {
+        speedChart.data.datasets[idx].label = displayName(id);
+        speedChart.update('none');
+      }
+    }
+
     // ====== Leaflet Map ======
     const map = L.map('map').setView([34.70, 137.72], 14);
+    setTimeout(() => map.invalidateSize(), 0);
+
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
@@ -127,19 +198,31 @@
     const e7toDeg = (v) => v / 1e7;
 
     // ====== UI build ======
+    loadLabels();
     const devlist = document.getElementById("devlist");
+
     for (const id of DEVICE_IDS) {
       const div = document.createElement("div");
-      div.className = "row";
+      div.className = "devrow";
       div.innerHTML = `
-        <label>
+        <div class="devleft">
           <input type="checkbox" data-id="${id}">
-          ${id}
-        </label>
+          <input class="labelInput" data-label-id="${id}" type="text" placeholder="${defaultLabel(id)}" value="${(labelMap.get(id) ?? '').replaceAll('"','&quot;')}">
+        </div>
         <span class="badge ng" id="status-${id}">unknown</span>
       `;
       devlist.appendChild(div);
     }
+
+    // label input handler
+    devlist.addEventListener('input', (ev) => {
+      const t = ev.target;
+      if(!(t instanceof HTMLElement)) return;
+      if(t.classList.contains('labelInput')){
+        const id = Number(t.getAttribute('data-label-id'));
+        if(Number.isFinite(id)) setLabel(id, t.value);
+      }
+    });
 
     function selectedIds() {
       return [...document.querySelectorAll("#devlist input[type=checkbox]")]
@@ -185,7 +268,7 @@
           fillOpacity: 0.9
         }).addTo(map);
 
-        m.bindTooltip(String(id), {
+        m.bindTooltip(displayName(id), {
           permanent: true,
           direction: "top",
           offset: [0, -8],
@@ -199,7 +282,7 @@
 
       const kmh = (p.speed/100*3.6).toFixed(1);
       m.bindPopup(
-        `ID:${id}<br>` +
+        `${displayName(id)}<br>` +
         `ts:${p.timestamp}<br>` +
         `spd:${kmh} km/h<br>` +
         `rssi:${p.rssi}<br>` +
@@ -212,25 +295,22 @@
     function setTrailFromHistory(id, items) {
       const color = colorForId(id);
       const pts = items.map(it => [e7toDeg(it.lat), e7toDeg(it.lon)]);
-      
-      // 既存があれば消して作り直す（確実）
+
       const old = trails.get(id);
       if (old) {
         map.removeLayer(old);
         trails.delete(id);
       }
-      
+
       const pl = L.polyline(pts, {
         color,
-        weight: 6,        // ← 太くする
-        opacity: 1.0,     // ← 濃くする
+        weight: 6,
+        opacity: 1.0,
         lineJoin: "round",
         lineCap: "round"
       }).addTo(map);
-      
-      // ← これが効くことが多い：線を前面へ
+
       pl.bringToFront();
-      
       trails.set(id, pl);
     }
 
@@ -301,7 +381,7 @@
       const color = colorForId(id);
       speedChart.data.datasets.push({
         _deviceId: id,
-        label: `ID ${id}`,
+        label: displayName(id),
         data: [],
         borderColor: color,
         backgroundColor: color,
@@ -322,6 +402,7 @@
     function setDatasetData(id, points, maxPts) {
       ensureDataset(id);
       const idx = findDatasetIndex(id);
+      speedChart.data.datasets[idx].label = displayName(id);
       speedChart.data.datasets[idx].data = points.slice(-maxPts);
     }
 
@@ -329,6 +410,7 @@
       ensureDataset(id);
       const idx = findDatasetIndex(id);
       const ds = speedChart.data.datasets[idx];
+      ds.label = displayName(id);
       const kmh = (speed_cms/100)*3.6;
       const last = ds.data.length ? ds.data[ds.data.length - 1] : null;
       if (!last || ts > last.x) {
@@ -337,12 +419,13 @@
       }
     }
 
+    // Build/update trail + chart from history for ALL checked IDs
     async function refreshSelectedHistory() {
       const ids = selectedIds();
       const trailOn = document.getElementById("trail").checked;
       const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
 
-      // remove unselected
+      // Remove unchecked devices
       for (const id of [...markers.keys()]) {
         if (!ids.includes(id)) clearDevice(id);
       }
@@ -350,7 +433,7 @@
         if (!ids.includes(ds._deviceId)) removeDataset(ds._deviceId);
       }
 
-      // For each selected id, fetch history once and build trail+chart
+      // Fetch history for checked IDs and apply
       for (const id of ids) {
         try {
           const hist = await fetchHistory(id, maxPts);
@@ -361,23 +444,23 @@
             continue;
           }
 
-          // trail
-          if (trailOn && !trails.has(id) && items.length > 1) {
+          setStatus(id, true);
+
+          if (trailOn && items.length > 1) {
             setTrailFromHistory(id, items);
           }
 
-          // chart dataset
           const pts = items.map(p => ({ x: p.timestamp, y: (p.speed/100)*3.6 }));
           setDatasetData(id, pts, maxPts);
 
-          // set lastTs to latest timestamp in history
           lastTs.set(id, items[items.length - 1].timestamp);
-          speedChart.update();
-          setStatus(id, true);
         } catch (e) {
           console.error(e);
         }
       }
+
+      speedChart.update();
+      setTimeout(() => map.invalidateSize(), 0);
     }
 
     // ====== Polling ======
@@ -404,17 +487,12 @@
         setStatus(id, true);
 
         const prevTs = lastTs.get(id);
-        // marker
         const ll = upsertMarker(p);
 
-        // trail
-        if (trailOn) {
-          if (!prevTs || p.timestamp > prevTs) {
-            appendTrailPoint(id, ll, maxPts);
-          }
+        if (trailOn && (!prevTs || p.timestamp > prevTs)) {
+          appendTrailPoint(id, ll, maxPts);
         }
 
-        // chart point
         if (!prevTs || p.timestamp > prevTs) {
           appendDatasetPoint(id, p.timestamp, p.speed, maxPts);
         }
@@ -430,14 +508,14 @@
       }
     }
 
-    function start() {
+    async function start() {
       stop();
-      // Build initial trails + chart from history for selected IDs
-      refreshSelectedHistory().catch(console.error);
-      tick().catch(console.error);
+      await refreshSelectedHistory();
+      await tick();
 
       const pollS = Number(document.getElementById("poll").value) || 3;
       timer = setInterval(() => tick().catch(console.error), pollS * 1000);
+      setTimeout(() => map.invalidateSize(), 0);
     }
 
     function stop() {
@@ -445,17 +523,18 @@
       timer = null;
     }
 
-    document.getElementById("start").addEventListener("click", start);
+    document.getElementById("start").addEventListener("click", () => start().catch(console.error));
     document.getElementById("stop").addEventListener("click", stop);
 
-    // When selection changes: rebuild history-based trail+chart
+    // When selection changes: await history rebuild, then update latest once
     devlist.addEventListener("change", () => {
-      refreshSelectedHistory().catch(console.error);
-      tick().catch(console.error);
+      (async () => {
+        await refreshSelectedHistory();
+        await tick();
+      })().catch(console.error);
     });
 
     document.getElementById("trail").addEventListener("change", () => {
-      // clear trails and rebuild if enabled
       if (!document.getElementById("trail").checked) {
         for (const p of trails.values()) map.removeLayer(p);
         trails.clear();
@@ -465,7 +544,7 @@
     });
 
     // Auto start
-    start();
+    start().catch(console.error);
   </script>
 </body>
 </html>
