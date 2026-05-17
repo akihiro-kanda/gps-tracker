@@ -2,28 +2,64 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>GPS Tracker (Polling, multi-device)</title>
+  <title>GPS Tracker (Polling, multi-device + Speed Chart)</title>
+
+  <!-- Leaflet -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
   <style>
-    body { margin:0; font-family: sans-serif; }
-    #map { width:100vw; height:100vh; }
+    body { margin: 0; font-family: sans-serif; }
+
+    /* Layout: map + bottom chart */
+    #wrap { height: 100vh; display: flex; flex-direction: column; }
+    #map { flex: 1 1 auto; }
+    #chartWrap { height: 28vh; padding: 6px 8px; background: #fff; border-top: 1px solid #ddd; }
+    #speedChart { width: 100%; height: 100%; }
+
+    /* Control panel */
     #panel {
-      position:absolute; top:20px; right:10px; z-index:1000;
-      background:rgba(255,255,255,0.7); padding:10px; border-radius:8px;
+      position: absolute; top: 20px; right: 10px; z-index: 1000;
+      background: rgba(255,255,255,0.7);
+      padding: 10px; border-radius: 8px;
       box-shadow: 0 2px 8px rgba(0,0,0,.2);
-      max-height: 80vh; overflow:auto; min-width: 160px;
+      max-height: 80vh; overflow: auto;
+      min-width: 160px;
       max-width: calc(80vw - 20px);
     }
-    .row { display:flex; align-items:center; gap:8px; }
-    .small { font-size: 12px; color:#444; }
-    .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eee; font-size:12px; }
-    .ok { background:#d9f7d9; }
-    .ng { background:#ffd6d6; }
-    #devlist label {
+
+    .row { display: flex; align-items: center; gap: 8px; }
+    .small { font-size: 12px; color: #444; }
+
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 10px; background: #eee; font-size: 12px; }
+    .ok { background: #d9f7d9; }
+    .ng { background: #ffd6d6; }
+
+    /* device list: keep as vertical list, but make label compact */
+    #devlist .row{
       display: flex;
       align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin: 2px 0;
+    }
+    #devlist .row > label{
+      flex: 0 0 auto;           /* do NOT stretch */
+      display: inline-flex;
+      align-items: center;
       gap: 4px;
+      white-space: nowrap;
       font-size: 14px;
+    }
+
+    /* Permanent ID label over marker */
+    .id-label {
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      border-radius: 10px;
+      padding: 1px 6px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 0;
     }
   </style>
 </head>
@@ -34,28 +70,48 @@
       <button id="stop">停止</button>
       <label class="row"><input type="checkbox" id="trail" checked>軌跡</label>
     </div>
+
     <div class="row" style="margin-top:6px;">
       <span class="small">ポーリング(S)</span>
-      <input id="poll" value="3" size="6">
+      <input id="poll" value="3" size="4">
+      <span class="small">点数</span>
+      <input id="trailPts" value="300" size="4">
     </div>
-    <div class="row" style="margin-top:6px;">
-      <span class="small">軌跡点数</span>
-      <input id="trailPts" value="300" size="5">
-    </div>
+
+    <div class="small" style="margin-top:6px;">チェックしたIDのみ表示（最大20台）</div>
     <hr>
     <div id="devlist"></div>
   </div>
 
-  <div id="map"></div>
+  <div id="wrap">
+    <div id="map"></div>
+    <div id="chartWrap">
+      <canvas id="speedChart"></canvas>
+    </div>
+  </div>
 
+  <!-- Leaflet JS -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+
   <script>
-    // ====== あなたのAPI ======
+    // ====== API ======
     const API_BASE = "https://fyx3533ssl.execute-api.us-east-1.amazonaws.com/prod";
 
-    // ====== 初期表示の候補デバイスID（最大20想定） ======
-    // ここは運用の登録台数に合わせて並べる
+    // ====== Candidate device IDs (max 20) ======
     const DEVICE_IDS = [1,2,3,4,5,6,7,8,9,10];
+
+    // ====== Color per ID ======
+    const COLOR_PALETTE = [
+      "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
+      "#a65628", "#f781bf", "#999999", "#66c2a5", "#fc8d62",
+      "#8da0cb", "#e78ac3", "#a6d854", "#ffd92f", "#e5c494",
+      "#b3b3b3", "#1b9e77", "#d95f02", "#7570b3", "#e7298a"
+    ];
+    function colorForId(id){
+      return COLOR_PALETTE[(id - 1) % COLOR_PALETTE.length];
+    }
 
     // ====== Leaflet Map ======
     const map = L.map('map').setView([34.70, 137.72], 14);
@@ -63,23 +119,22 @@
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
-    // device_id -> marker / polyline / lastTimestamp
-    const markers = new Map();
-    const trails  = new Map();
-    const lastTs  = new Map();
+    // ====== State ======
+    const markers = new Map(); // id -> circleMarker
+    const trails  = new Map(); // id -> polyline
+    const lastTs  = new Map(); // id -> last timestamp we processed (UNIX sec)
 
-    // e7 int -> degree
     const e7toDeg = (v) => v / 1e7;
 
-    // ====== UI生成 ======
+    // ====== UI build ======
     const devlist = document.getElementById("devlist");
     for (const id of DEVICE_IDS) {
       const div = document.createElement("div");
       div.className = "row";
       div.innerHTML = `
-        <label class="row" style="flex:1;">
+        <label>
           <input type="checkbox" data-id="${id}">
-          ID ${id}
+          ${id}
         </label>
         <span class="badge ng" id="status-${id}">unknown</span>
       `;
@@ -99,7 +154,7 @@
       else    { el.textContent = "none";  el.className = "badge ng"; }
     }
 
-    // ====== API呼び出し ======
+    // ====== API calls ======
     async function fetchLatest(ids) {
       const url = `${API_BASE}/latest?ids=${encodeURIComponent(ids.join(","))}`;
       const r = await fetch(url);
@@ -114,49 +169,72 @@
       return await r.json();
     }
 
-    // ====== 描画ユーティリティ ======
+    // ====== Map drawing ======
     function upsertMarker(p) {
       const id = p.device_id;
       const ll = [e7toDeg(p.lat), e7toDeg(p.lon)];
+      const color = colorForId(id);
+
       let m = markers.get(id);
       if (!m) {
-        m = L.marker(ll).addTo(map);
+        m = L.circleMarker(ll, {
+          radius: 7,
+          color: color,
+          weight: 2,
+          fillColor: color,
+          fillOpacity: 0.9
+        }).addTo(map);
+
+        m.bindTooltip(String(id), {
+          permanent: true,
+          direction: "top",
+          offset: [0, -8],
+          className: "id-label"
+        });
+
         markers.set(id, m);
       } else {
         m.setLatLng(ll);
       }
+
+      const kmh = (p.speed/100*3.6).toFixed(1);
       m.bindPopup(
         `ID:${id}<br>` +
         `ts:${p.timestamp}<br>` +
-        `spd:${(p.speed/100).toFixed(2)} m/s<br>` +
+        `spd:${kmh} km/h<br>` +
         `rssi:${p.rssi}<br>` +
         `gw:${p.gw ?? ""}`
       );
+
       return ll;
     }
 
     function setTrailFromHistory(id, items) {
+      const color = colorForId(id);
       const pts = items.map(it => [e7toDeg(it.lat), e7toDeg(it.lon)]);
       let pl = trails.get(id);
       if (!pl) {
-        pl = L.polyline(pts, { color: "red" }).addTo(map);
+        pl = L.polyline(pts, { color, weight: 4, opacity: 0.85 }).addTo(map);
         trails.set(id, pl);
       } else {
         pl.setLatLngs(pts);
+        pl.setStyle({ color, weight: 4, opacity: 0.85 });
       }
     }
 
     function appendTrailPoint(id, ll, maxPts) {
+      const color = colorForId(id);
       let pl = trails.get(id);
       if (!pl) {
-        pl = L.polyline([ll], { color: "red" }).addTo(map);
+        pl = L.polyline([ll], { color, weight: 4, opacity: 0.85 }).addTo(map);
         trails.set(id, pl);
         return;
       }
       const pts = pl.getLatLngs();
       pts.push(L.latLng(ll[0], ll[1]));
-      if (pts.length > maxPts) pts.shift();
+      while (pts.length > maxPts) pts.shift();
       pl.setLatLngs(pts);
+      pl.setStyle({ color, weight: 4, opacity: 0.85 });
     }
 
     function clearDevice(id) {
@@ -166,57 +244,175 @@
       if (p) { map.removeLayer(p); trails.delete(id); }
       lastTs.delete(id);
       setStatus(id, false);
+      removeDataset(id);
     }
 
-    // ====== ポーリング本体 ======
+    // ====== Speed chart (Chart.js) ======
+    const chartCtx = document.getElementById("speedChart");
+    const speedChart = new Chart(chartCtx, {
+      type: "line",
+      data: { datasets: [] },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        parsing: false,
+        scales: {
+          x: {
+            type: "linear",
+            title: { display: true, text: "Time" },
+            ticks: {
+              callback: (v) => {
+                const d = new Date(Number(v) * 1000);
+                return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+              }
+            }
+          },
+          y: {
+            title: { display: true, text: "Speed (km/h)" },
+            beginAtZero: true
+          }
+        },
+        plugins: {
+          legend: { display: true }
+        }
+      }
+    });
+
+    function findDatasetIndex(id) {
+      return speedChart.data.datasets.findIndex(ds => ds._deviceId === id);
+    }
+
+    function ensureDataset(id) {
+      const idx = findDatasetIndex(id);
+      if (idx >= 0) return;
+      const color = colorForId(id);
+      speedChart.data.datasets.push({
+        _deviceId: id,
+        label: `ID ${id}`,
+        data: [],
+        borderColor: color,
+        backgroundColor: color,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.15
+      });
+    }
+
+    function removeDataset(id) {
+      const idx = findDatasetIndex(id);
+      if (idx >= 0) {
+        speedChart.data.datasets.splice(idx, 1);
+        speedChart.update();
+      }
+    }
+
+    function setDatasetData(id, points, maxPts) {
+      ensureDataset(id);
+      const idx = findDatasetIndex(id);
+      speedChart.data.datasets[idx].data = points.slice(-maxPts);
+    }
+
+    function appendDatasetPoint(id, ts, speed_cms, maxPts) {
+      ensureDataset(id);
+      const idx = findDatasetIndex(id);
+      const ds = speedChart.data.datasets[idx];
+      const kmh = (speed_cms/100)*3.6;
+      const last = ds.data.length ? ds.data[ds.data.length - 1] : null;
+      if (!last || ts > last.x) {
+        ds.data.push({ x: ts, y: kmh });
+        while (ds.data.length > maxPts) ds.data.shift();
+      }
+    }
+
+    async function refreshSelectedHistory() {
+      const ids = selectedIds();
+      const trailOn = document.getElementById("trail").checked;
+      const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
+
+      // remove unselected
+      for (const id of [...markers.keys()]) {
+        if (!ids.includes(id)) clearDevice(id);
+      }
+      for (const ds of [...speedChart.data.datasets]) {
+        if (!ids.includes(ds._deviceId)) removeDataset(ds._deviceId);
+      }
+
+      // For each selected id, fetch history once and build trail+chart
+      for (const id of ids) {
+        try {
+          const hist = await fetchHistory(id, maxPts);
+          const items = hist.items || [];
+
+          if (items.length === 0) {
+            setStatus(id, false);
+            continue;
+          }
+
+          // trail
+          if (trailOn && !trails.has(id) && items.length > 1) {
+            setTrailFromHistory(id, items);
+          }
+
+          // chart dataset
+          const pts = items.map(p => ({ x: p.timestamp, y: (p.speed/100)*3.6 }));
+          setDatasetData(id, pts, maxPts);
+
+          // set lastTs to latest timestamp in history
+          lastTs.set(id, items[items.length - 1].timestamp);
+          speedChart.update();
+          setStatus(id, true);
+        } catch (e) {
+          console.error(e);
+        }
+      }
+    }
+
+    // ====== Polling ======
     let timer = null;
 
     async function tick() {
       const ids = selectedIds();
       if (ids.length === 0) return;
 
-      const pollS = Number(document.getElementById("poll").value) || 3;
       const trailOn = document.getElementById("trail").checked;
-      const trailPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
+      const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
 
-      // 最新位置をまとめて取得
       const latest = await fetchLatest(ids);
 
       for (const p of latest.items) {
         const id = p.device_id;
 
         if (!p.found) {
-          // 存在しないデバイス：表示しない（チェックは残してもOK）
           setStatus(id, false);
-          // 既に地図にある場合は消す
-          if (markers.has(id)) clearDevice(id);
+          if (markers.has(id) || trails.has(id) || findDatasetIndex(id) >= 0) clearDevice(id);
           continue;
         }
 
         setStatus(id, true);
 
-        // marker更新
+        const prevTs = lastTs.get(id);
+        // marker
         const ll = upsertMarker(p);
 
-        // 軌跡
+        // trail
         if (trailOn) {
-          if (!trails.has(id)) {
-            // 初回だけ履歴をまとめて取得して線を作る（軽量＆見た目が良い）
-            const hist = await fetchHistory(id, trailPts);
-            if (hist.items && hist.items.length > 1) {
-              setTrailFromHistory(id, hist.items);
-            } else {
-              appendTrailPoint(id, ll, trailPts);
-            }
-          } else {
-            // 2回目以降は最新点だけ追記（軽量）
-            appendTrailPoint(id, ll, trailPts);
+          if (!prevTs || p.timestamp > prevTs) {
+            appendTrailPoint(id, ll, maxPts);
           }
         }
+
+        // chart point
+        if (!prevTs || p.timestamp > prevTs) {
+          appendDatasetPoint(id, p.timestamp, p.speed, maxPts);
+        }
+
         lastTs.set(id, p.timestamp);
       }
 
-      // チェック外のものは消す
+      speedChart.update('none');
+
+      // Clear unchecked devices
       for (const id of [...markers.keys()]) {
         if (!ids.includes(id)) clearDevice(id);
       }
@@ -224,9 +420,12 @@
 
     function start() {
       stop();
+      // Build initial trails + chart from history for selected IDs
+      refreshSelectedHistory().catch(console.error);
       tick().catch(console.error);
+
       const pollS = Number(document.getElementById("poll").value) || 3;
-      timer = setInterval(() => tick().catch(console.error), pollS *1000);
+      timer = setInterval(() => tick().catch(console.error), pollS * 1000);
     }
 
     function stop() {
@@ -236,9 +435,24 @@
 
     document.getElementById("start").addEventListener("click", start);
     document.getElementById("stop").addEventListener("click", stop);
-    devlist.addEventListener("change", () => tick().catch(console.error));
 
-    // 起動（まずは停止状態にしておき、チェックしたら開始でもOK）
+    // When selection changes: rebuild history-based trail+chart
+    devlist.addEventListener("change", () => {
+      refreshSelectedHistory().catch(console.error);
+      tick().catch(console.error);
+    });
+
+    document.getElementById("trail").addEventListener("change", () => {
+      // clear trails and rebuild if enabled
+      if (!document.getElementById("trail").checked) {
+        for (const p of trails.values()) map.removeLayer(p);
+        trails.clear();
+      } else {
+        refreshSelectedHistory().catch(console.error);
+      }
+    });
+
+    // Auto start
     start();
   </script>
 </body>
