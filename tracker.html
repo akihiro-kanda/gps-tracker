@@ -23,8 +23,8 @@
       padding: 10px; border-radius: 8px;
       box-shadow: 0 2px 8px rgba(0,0,0,.2);
       max-height: 80vh; overflow: auto;
-      min-width: 180px;
-      max-width: calc(86vw - 20px);
+      min-width: 200px;
+      max-width: calc(90vw - 20px);
     }
 
     .row { display: flex; align-items: center; gap: 8px; }
@@ -34,7 +34,7 @@
     .ok { background: #d9f7d9; }
     .ng { background: #ffd6d6; }
 
-    /* device list: vertical list (no grid), compact */
+    /* device list row (no grid) */
     #devlist .devrow{
       display: flex;
       align-items: center;
@@ -42,24 +42,18 @@
       gap: 6px;
       margin: 3px 0;
     }
-    #devlist .devleft{
+    #devlist label{
       display: inline-flex;
       align-items: center;
       gap: 6px;
       flex: 1 1 auto;
       min-width: 0;
+      white-space: nowrap;
+      font-size: 14px;
     }
 
     #devlist input[type=checkbox]{
       transform: scale(1.05);
-    }
-
-    /* Custom label input */
-    .labelInput{
-      width: 120px;
-      max-width: 42vw;
-      font-size: 13px;
-      padding: 2px 4px;
     }
 
     /* Permanent label over marker */
@@ -73,6 +67,8 @@
       border: 0;
       white-space: nowrap;
     }
+
+    button { cursor: pointer; }
   </style>
 </head>
 <body>
@@ -90,8 +86,13 @@
       <input id="trailPts" value="300" size="4">
     </div>
 
+    <div class="row" style="margin-top:6px;">
+      <button id="reloadLabels">labels.csv 再読み込み</button>
+      <span class="small" id="labelStatus">-</span>
+    </div>
+
     <div class="small" style="margin-top:6px;">
-      表示データ選択(+ラベル入力)
+      表示データ選択(表示名はlabels.csv)
     </div>
     <hr>
     <div id="devlist"></div>
@@ -113,6 +114,9 @@
     // ====== API ======
     const API_BASE = "https://fyx3533ssl.execute-api.us-east-1.amazonaws.com/prod";
 
+    // ====== Labels CSV (same folder as tracker.html) ======
+    const LABELS_CSV_URL = "./labels.csv";
+
     // ====== Candidate device IDs (max 20) ======
     const DEVICE_IDS = [1,2,3,4,5,6,7,8,9,10];
 
@@ -127,58 +131,51 @@
       return COLOR_PALETTE[(id - 1) % COLOR_PALETTE.length];
     }
 
-    // ====== Label map (custom text per device_id) ======
-    const LABEL_STORE_KEY = "gps_tracker_label_map_v1";
-    const labelMap = new Map(); // id -> string
-
-    function loadLabels(){
-      try{
-        const raw = localStorage.getItem(LABEL_STORE_KEY);
-        if(!raw) return;
-        const obj = JSON.parse(raw);
-        for(const [k,v] of Object.entries(obj)){
-          const id = Number(k);
-          if(Number.isFinite(id) && typeof v === 'string') labelMap.set(id, v);
-        }
-      }catch(e){
-        console.warn('loadLabels failed', e);
-      }
-    }
-
-    function saveLabels(){
-      try{
-        const obj = {};
-        for(const [id, name] of labelMap.entries()) obj[String(id)] = name;
-        localStorage.setItem(LABEL_STORE_KEY, JSON.stringify(obj));
-      }catch(e){
-        console.warn('saveLabels failed', e);
-      }
-    }
+    // ====== Labels (CSV only) ======
+    const labelMap = new Map(); // id -> label
+    const labelStatusEl = document.getElementById('labelStatus');
 
     function defaultLabel(id){
       return `ID ${id}`;
     }
-
     function displayName(id){
       const s = labelMap.get(id);
       return (s && s.trim().length) ? s.trim() : defaultLabel(id);
     }
 
-    function setLabel(id, text){
-      const t = (text ?? '').toString().trim();
-      if(t.length === 0) labelMap.delete(id);
-      else labelMap.set(id, t);
-      saveLabels();
-      // Update marker tooltip if exists
-      const m = markers.get(id);
-      if(m && m.getTooltip && m.getTooltip()) {
-        m.setTooltipContent(displayName(id));
-      }
-      // Update chart dataset label if exists
-      const idx = findDatasetIndex(id);
-      if(idx >= 0) {
-        speedChart.data.datasets[idx].label = displayName(id);
-        speedChart.update('none');
+    async function loadLabelsFromCsv(url){
+      labelMap.clear();
+      labelStatusEl.textContent = 'labels.csv 読込中...';
+      try{
+        const r = await fetch(url, { cache: 'no-store' });
+        if(!r.ok) throw new Error(`HTTP ${r.status}`);
+        let text = await r.text();
+        text = text.replace(/^\uFEFF/, '');
+
+        const lines = text.split(/\r?\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+        if(lines.length === 0){
+          labelStatusEl.textContent = 'labels.csv 空';
+          return;
+        }
+
+        let start = 0;
+        if(/device_id/i.test(lines[0]) && /label/i.test(lines[0])) start = 1;
+
+        let count = 0;
+        for(let i=start;i<lines.length;i++){
+          const parts = lines[i].split(',');
+          if(parts.length < 2) continue;
+          const id = Number(parts[0].trim());
+          const label = parts.slice(1).join(',').trim();
+          if(!Number.isFinite(id) || id <= 0) continue;
+          if(!label) continue;
+          labelMap.set(id, label);
+          count++;
+        }
+        labelStatusEl.textContent = `labels.csv ${count}件`;
+      }catch(e){
+        console.warn('labels.csv load failed', e);
+        labelStatusEl.textContent = 'labels.csv 読込失敗';
       }
     }
 
@@ -196,148 +193,6 @@
     const lastTs  = new Map(); // id -> last timestamp we processed (UNIX sec)
 
     const e7toDeg = (v) => v / 1e7;
-
-    // ====== UI build ======
-    loadLabels();
-    const devlist = document.getElementById("devlist");
-
-    for (const id of DEVICE_IDS) {
-      const div = document.createElement("div");
-      div.className = "devrow";
-      div.innerHTML = `
-        <div class="devleft">
-          <input type="checkbox" data-id="${id}">
-          <input class="labelInput" data-label-id="${id}" type="text" placeholder="${defaultLabel(id)}" value="${(labelMap.get(id) ?? '').replaceAll('"','&quot;')}">
-        </div>
-        <span class="badge ng" id="status-${id}">unknown</span>
-      `;
-      devlist.appendChild(div);
-    }
-
-    // label input handler
-    devlist.addEventListener('input', (ev) => {
-      const t = ev.target;
-      if(!(t instanceof HTMLElement)) return;
-      if(t.classList.contains('labelInput')){
-        const id = Number(t.getAttribute('data-label-id'));
-        if(Number.isFinite(id)) setLabel(id, t.value);
-      }
-    });
-
-    function selectedIds() {
-      return [...document.querySelectorAll("#devlist input[type=checkbox]")]
-        .filter(x => x.checked)
-        .map(x => Number(x.dataset.id));
-    }
-
-    function setStatus(id, ok) {
-      const el = document.getElementById(`status-${id}`);
-      if (!el) return;
-      if (ok) { el.textContent = "found"; el.className = "badge ok"; }
-      else    { el.textContent = "none";  el.className = "badge ng"; }
-    }
-
-    // ====== API calls ======
-    async function fetchLatest(ids) {
-      const url = `${API_BASE}/latest?ids=${encodeURIComponent(ids.join(","))}`;
-      const r = await fetch(url);
-      if (!r.ok) throw new Error("latest fetch failed");
-      return await r.json();
-    }
-
-    async function fetchHistory(deviceId, limit) {
-      const url = `${API_BASE}/history?device_id=${encodeURIComponent(deviceId)}&limit=${encodeURIComponent(limit)}`;
-      const r = await fetch(url);
-      if (!r.ok) throw new Error("history fetch failed");
-      return await r.json();
-    }
-
-    // ====== Map drawing ======
-    function upsertMarker(p) {
-      const id = p.device_id;
-      const ll = [e7toDeg(p.lat), e7toDeg(p.lon)];
-      const color = colorForId(id);
-
-      let m = markers.get(id);
-      if (!m) {
-        m = L.circleMarker(ll, {
-          radius: 7,
-          color: color,
-          weight: 2,
-          fillColor: color,
-          fillOpacity: 0.9
-        }).addTo(map);
-
-        m.bindTooltip(displayName(id), {
-          permanent: true,
-          direction: "top",
-          offset: [0, -8],
-          className: "id-label"
-        });
-
-        markers.set(id, m);
-      } else {
-        m.setLatLng(ll);
-      }
-
-      const kmh = (p.speed/100*3.6).toFixed(1);
-      m.bindPopup(
-        `${displayName(id)}<br>` +
-        `ts:${p.timestamp}<br>` +
-        `spd:${kmh} km/h<br>` +
-        `rssi:${p.rssi}<br>` +
-        `gw:${p.gw ?? ""}`
-      );
-
-      return ll;
-    }
-
-    function setTrailFromHistory(id, items) {
-      const color = colorForId(id);
-      const pts = items.map(it => [e7toDeg(it.lat), e7toDeg(it.lon)]);
-
-      const old = trails.get(id);
-      if (old) {
-        map.removeLayer(old);
-        trails.delete(id);
-      }
-
-      const pl = L.polyline(pts, {
-        color,
-        weight: 6,
-        opacity: 1.0,
-        lineJoin: "round",
-        lineCap: "round"
-      }).addTo(map);
-
-      pl.bringToFront();
-      trails.set(id, pl);
-    }
-
-    function appendTrailPoint(id, ll, maxPts) {
-      const color = colorForId(id);
-      let pl = trails.get(id);
-      if (!pl) {
-        pl = L.polyline([ll], { color, weight: 4, opacity: 0.85 }).addTo(map);
-        trails.set(id, pl);
-        return;
-      }
-      const pts = pl.getLatLngs();
-      pts.push(L.latLng(ll[0], ll[1]));
-      while (pts.length > maxPts) pts.shift();
-      pl.setLatLngs(pts);
-      pl.setStyle({ color, weight: 4, opacity: 0.85 });
-    }
-
-    function clearDevice(id) {
-      const m = markers.get(id);
-      if (m) { map.removeLayer(m); markers.delete(id); }
-      const p = trails.get(id);
-      if (p) { map.removeLayer(p); trails.delete(id); }
-      lastTs.delete(id);
-      setStatus(id, false);
-      removeDataset(id);
-    }
 
     // ====== Speed chart (Chart.js) ======
     const chartCtx = document.getElementById("speedChart");
@@ -419,6 +274,149 @@
       }
     }
 
+    // ====== UI build ======
+    const devlist = document.getElementById("devlist");
+
+    function renderDevList(){
+      devlist.innerHTML = '';
+      for (const id of DEVICE_IDS) {
+        const div = document.createElement("div");
+        div.className = "devrow";
+        div.innerHTML = `
+          <label>
+            <input type="checkbox" data-id="${id}">
+            ${escapeHtml(displayName(id))}
+          </label>
+          <span class="badge ng" id="status-${id}">unknown</span>
+        `;
+        devlist.appendChild(div);
+      }
+    }
+
+    function escapeHtml(s){
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function selectedIds() {
+      return [...document.querySelectorAll("#devlist input[type=checkbox]")]
+        .filter(x => x.checked)
+        .map(x => Number(x.dataset.id));
+    }
+
+    function setStatus(id, ok) {
+      const el = document.getElementById(`status-${id}`);
+      if (!el) return;
+      if (ok) { el.textContent = "found"; el.className = "badge ok"; }
+      else    { el.textContent = "none";  el.className = "badge ng"; }
+    }
+
+    // ====== API calls ======
+    async function fetchLatest(ids) {
+      const url = `${API_BASE}/latest?ids=${encodeURIComponent(ids.join(","))}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("latest fetch failed");
+      return await r.json();
+    }
+
+    async function fetchHistory(deviceId, limit) {
+      const url = `${API_BASE}/history?device_id=${encodeURIComponent(deviceId)}&limit=${encodeURIComponent(limit)}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("history fetch failed");
+      return await r.json();
+    }
+
+    // ====== Map drawing ======
+    function upsertMarker(p) {
+      const id = p.device_id;
+      const ll = [e7toDeg(p.lat), e7toDeg(p.lon)];
+      const color = colorForId(id);
+
+      let m = markers.get(id);
+      if (!m) {
+        m = L.circleMarker(ll, {
+          radius: 7,
+          color: color,
+          weight: 2,
+          fillColor: color,
+          fillOpacity: 0.9
+        }).addTo(map);
+
+        m.bindTooltip(displayName(id), {
+          permanent: true,
+          direction: "top",
+          offset: [0, -8],
+          className: "id-label"
+        });
+
+        markers.set(id, m);
+      } else {
+        m.setLatLng(ll);
+        if(m.getTooltip && m.getTooltip()) m.setTooltipContent(displayName(id));
+      }
+
+      const kmh = (p.speed/100*3.6).toFixed(1);
+      m.bindPopup(
+        `${displayName(id)}<br>` +
+        `ts:${p.timestamp}<br>` +
+        `spd:${kmh} km/h<br>` +
+        `rssi:${p.rssi}<br>` +
+        `gw:${p.gw ?? ""}`
+      );
+
+      return ll;
+    }
+
+    function setTrailFromHistory(id, items) {
+      const color = colorForId(id);
+      const pts = items.map(it => [e7toDeg(it.lat), e7toDeg(it.lon)]);
+
+      const old = trails.get(id);
+      if (old) {
+        map.removeLayer(old);
+        trails.delete(id);
+      }
+
+      const pl = L.polyline(pts, {
+        color,
+        weight: 6,
+        opacity: 1.0,
+        lineJoin: "round",
+        lineCap: "round"
+      }).addTo(map);
+
+      pl.bringToFront();
+      trails.set(id, pl);
+    }
+
+    function appendTrailPoint(id, ll, maxPts) {
+      const color = colorForId(id);
+      let pl = trails.get(id);
+      if (!pl) {
+        pl = L.polyline([ll], { color, weight: 4, opacity: 0.85 }).addTo(map);
+        trails.set(id, pl);
+        return;
+      }
+      const pts = pl.getLatLngs();
+      pts.push(L.latLng(ll[0], ll[1]));
+      while (pts.length > maxPts) pts.shift();
+      pl.setLatLngs(pts);
+      pl.setStyle({ color, weight: 4, opacity: 0.85 });
+    }
+
+    function clearDevice(id) {
+      const m = markers.get(id);
+      if (m) { map.removeLayer(m); markers.delete(id); }
+      const p = trails.get(id);
+      if (p) { map.removeLayer(p); trails.delete(id); }
+      lastTs.delete(id);
+      setStatus(id, false);
+      removeDataset(id);
+    }
+
     // Build/update trail + chart from history for ALL checked IDs
     async function refreshSelectedHistory() {
       const ids = selectedIds();
@@ -433,7 +431,6 @@
         if (!ids.includes(ds._deviceId)) removeDataset(ds._deviceId);
       }
 
-      // Fetch history for checked IDs and apply
       for (const id of ids) {
         try {
           const hist = await fetchHistory(id, maxPts);
@@ -523,10 +520,17 @@
       timer = null;
     }
 
+    // ====== Event wiring ======
     document.getElementById("start").addEventListener("click", () => start().catch(console.error));
     document.getElementById("stop").addEventListener("click", stop);
 
-    // When selection changes: await history rebuild, then update latest once
+    document.getElementById('reloadLabels').addEventListener('click', async () => {
+      await loadLabelsFromCsv(LABELS_CSV_URL);
+      renderDevList();
+      await refreshSelectedHistory();
+      await tick();
+    });
+
     devlist.addEventListener("change", () => {
       (async () => {
         await refreshSelectedHistory();
@@ -543,8 +547,12 @@
       }
     });
 
-    // Auto start
-    start().catch(console.error);
+    // ====== Init sequence ======
+    (async () => {
+      await loadLabelsFromCsv(LABELS_CSV_URL);
+      renderDevList();
+      start().catch(console.error);
+    })();
   </script>
 </body>
 </html>
