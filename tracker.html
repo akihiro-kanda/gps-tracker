@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>GPS Tracker (Polling, multi-device + Speed Chart)</title>
+  <title>GPS Tracker (Polling + Historical Mode + Speed Chart)</title>
 
   <!-- Leaflet -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
@@ -23,11 +23,11 @@
       padding: 10px; border-radius: 8px;
       box-shadow: 0 2px 8px rgba(0,0,0,.2);
       max-height: 80vh; overflow: auto;
-      min-width: 200px;
-      max-width: calc(90vw - 20px);
+      min-width: 220px;
+      max-width: calc(92vw - 20px);
     }
 
-    .row { display: flex; align-items: center; gap: 8px; }
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .small { font-size: 12px; color: #444; }
 
     .badge { display: inline-block; padding: 2px 6px; border-radius: 10px; background: #eee; font-size: 12px; }
@@ -68,6 +68,8 @@
       white-space: nowrap;
     }
 
+    input[type=datetime-local] { font-size: 12px; padding: 2px 4px; }
+    input[type=number] { font-size: 12px; padding: 2px 4px; }
     button { cursor: pointer; }
   </style>
 </head>
@@ -81,9 +83,22 @@
 
     <div class="row" style="margin-top:6px;">
       <span class="small">ポーリング(S)</span>
-      <input id="poll" value="3" size="4">
-      <span class="small">点数</span>
-      <input id="trailPts" value="300" size="4">
+      <input id="poll" value="3" size="4" inputmode="numeric">
+      <span class="small">秒数</span>
+      <input id="trailPts" value="300" size="4" inputmode="numeric">
+    </div>
+
+    <div class="row" style="margin-top:6px;">
+      <label class="row" title="チェックON=現在モード(ポーリング) / OFF=過去モード(指定日時で固定)">
+        <input type="checkbox" id="liveMode" checked>
+        現在時刻基準
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:4px;">
+      <span class="small">過去基準日時</span>
+      <input id="anchorTime" type="datetime-local" step="1">
+      <button id="applyPast">適用</button>
     </div>
 
     <div class="row" style="margin-top:6px;">
@@ -92,7 +107,7 @@
     </div>
 
     <div class="small" style="margin-top:6px;">
-      表示選択(ラベルはlabels.csv))
+      表示選択（表示名は <b>labels.csv</b> ）
     </div>
     <hr>
     <div id="devlist"></div>
@@ -132,12 +147,9 @@
     const labelMap = new Map(); // id -> label
     const labelStatusEl = document.getElementById('labelStatus');
 
-    function defaultLabel(id){
-      return `ID ${id}`;
-    }
     function displayName(id){
       const s = labelMap.get(id);
-      return (s && s.trim().length) ? s.trim() : defaultLabel(id);
+      return (s && s.trim().length) ? s.trim() : `ID ${id}`;
     }
 
     function escapeHtml(s){
@@ -331,16 +343,20 @@
       return await r.json();
     }
 
-    async function fetchHistory(deviceId, limit) {
-      const url = `${API_BASE}/history?device_id=${encodeURIComponent(deviceId)}&limit=${encodeURIComponent(limit)}`;
+    // history supports optional to=UNIXsec (anchor), and returns items in ascending order (old->new)
+    async function fetchHistory(deviceId, limit, toUnix=null) {
+      const params = new URLSearchParams();
+      params.set('device_id', deviceId);
+      params.set('limit', limit);
+      if (toUnix !== null) params.set('to', toUnix);
+      const url = `${API_BASE}/history?${params.toString()}`;
       const r = await fetch(url);
       if (!r.ok) throw new Error("history fetch failed");
       return await r.json();
     }
 
     // ====== Map drawing ======
-    function upsertMarker(p) {
-      const id = p.device_id;
+    function upsertMarkerFromPoint(id, p) {
       const ll = [e7toDeg(p.lat), e7toDeg(p.lon)];
       const color = colorForId(id);
 
@@ -426,13 +442,52 @@
       removeDataset(id);
     }
 
-    // Build/update trail + chart from history for ALL checked IDs
-    async function refreshSelectedHistory() {
+    function clearAll(){
+      for (const id of [...markers.keys()]) clearDevice(id);
+      // chart datasets are removed by clearDevice via removeDataset
+      // also clear any remaining datasets
+      speedChart.data.datasets = [];
+      speedChart.update();
+    }
+
+    // ====== Modes ======
+    let timer = null;
+
+    function isLiveMode(){
+      return document.getElementById('liveMode').checked;
+    }
+
+    function anchorUnix(){
+      const s = document.getElementById('anchorTime').value;
+      if(!s) return null;
+      const d = new Date(s);
+      if(Number.isNaN(d.getTime())) return null;
+      return Math.floor(d.getTime()/1000);
+    }
+
+    function setAnchorNowIfEmpty(){
+      const el = document.getElementById('anchorTime');
+      if(el.value) return;
+      const d = new Date();
+      // datetime-local expects local time, format YYYY-MM-DDTHH:MM:SS
+      const pad = (n)=> String(n).padStart(2,'0');
+      const v = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      el.value = v;
+    }
+
+    function updateAnchorUi(){
+      const live = isLiveMode();
+      document.getElementById('anchorTime').disabled = live;
+      document.getElementById('applyPast').disabled = live;
+    }
+
+    // ====== Live mode: latest polling + history initial ======
+    async function refreshSelectedHistoryLive() {
       const ids = selectedIds();
       const trailOn = document.getElementById("trail").checked;
       const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
 
-      // Remove unchecked devices
+      // Remove unchecked
       for (const id of [...markers.keys()]) {
         if (!ids.includes(id)) clearDevice(id);
       }
@@ -441,38 +496,23 @@
       }
 
       for (const id of ids) {
-        try {
-          const hist = await fetchHistory(id, maxPts);
-          const items = hist.items || [];
-
-          if (items.length === 0) {
-            setStatus(id, false);
-            continue;
-          }
-
-          setStatus(id, true);
-
-          if (trailOn && items.length > 1) {
-            setTrailFromHistory(id, items);
-          }
-
-          const pts = items.map(p => ({ x: p.timestamp, y: (p.speed/100)*3.6 }));
-          setDatasetData(id, pts, maxPts);
-
-          lastTs.set(id, items[items.length - 1].timestamp);
-        } catch (e) {
-          console.error(e);
+        const hist = await fetchHistory(id, maxPts, null);
+        const items = hist.items || [];
+        if(items.length === 0){
+          setStatus(id, false);
+          continue;
         }
+        setStatus(id, true);
+        if(trailOn && items.length > 1) setTrailFromHistory(id, items);
+        setDatasetData(id, items.map(p => ({x:p.timestamp, y:(p.speed/100)*3.6})), maxPts);
+        lastTs.set(id, items[items.length-1].timestamp);
       }
 
       speedChart.update();
       setTimeout(() => map.invalidateSize(), 0);
     }
 
-    // ====== Polling ======
-    let timer = null;
-
-    async function tick() {
+    async function tickLive(){
       const ids = selectedIds();
       if (ids.length === 0) return;
 
@@ -483,7 +523,6 @@
 
       for (const p of latest.items) {
         const id = p.device_id;
-
         if (!p.found) {
           setStatus(id, false);
           if (markers.has(id) || trails.has(id) || findDatasetIndex(id) >= 0) clearDevice(id);
@@ -491,9 +530,8 @@
         }
 
         setStatus(id, true);
-
         const prevTs = lastTs.get(id);
-        const ll = upsertMarker(p);
+        const ll = upsertMarkerFromPoint(id, p);
 
         if (trailOn && (!prevTs || p.timestamp > prevTs)) {
           appendTrailPoint(id, ll, maxPts);
@@ -508,60 +546,128 @@
 
       speedChart.update('none');
 
-      // Clear unchecked devices
+      // Remove unchecked
       for (const id of [...markers.keys()]) {
         if (!ids.includes(id)) clearDevice(id);
       }
     }
 
-    async function start() {
-      stop();
-      await refreshSelectedHistory();
-      await tick();
-
+    async function startLive(){
+      stopTimer();
+      await refreshSelectedHistoryLive();
+      await tickLive();
       const pollS = Number(document.getElementById("poll").value) || 3;
-      timer = setInterval(() => tick().catch(console.error), pollS * 1000);
+      timer = setInterval(() => tickLive().catch(console.error), pollS * 1000);
+    }
+
+    // ====== Past mode: fixed at anchor time ======
+    async function renderPastAt(anchor){
+      stopTimer();
+      clearAll();
+
+      const ids = selectedIds();
+      const trailOn = document.getElementById("trail").checked;
+      const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
+
+      if(ids.length === 0) return;
+      if(anchor === null){
+        alert('過去表示の日時を入力してください');
+        return;
+      }
+
+      for (const id of ids) {
+        const hist = await fetchHistory(id, maxPts, anchor);
+        const items = hist.items || [];
+        if(items.length === 0){
+          setStatus(id, false);
+          continue;
+        }
+        setStatus(id, true);
+
+        // trail from history (already old->new)
+        if(trailOn && items.length > 1) setTrailFromHistory(id, items);
+
+        // marker at last point (closest to anchor)
+        const last = items[items.length - 1];
+        upsertMarkerFromPoint(id, last);
+
+        // chart
+        setDatasetData(id, items.map(p => ({x:p.timestamp, y:(p.speed/100)*3.6})), maxPts);
+
+        lastTs.set(id, last.timestamp);
+      }
+
+      speedChart.update();
       setTimeout(() => map.invalidateSize(), 0);
     }
 
-    function stop() {
-      if (timer) clearInterval(timer);
+    function stopTimer(){
+      if(timer) clearInterval(timer);
       timer = null;
     }
 
     // ====== Event wiring ======
-    document.getElementById("start").addEventListener("click", () => start().catch(console.error));
-    document.getElementById("stop").addEventListener("click", stop);
+    document.getElementById("start").addEventListener("click", () => {
+      if(isLiveMode()) startLive().catch(console.error);
+      else renderPastAt(anchorUnix()).catch(console.error);
+    });
+    document.getElementById("stop").addEventListener("click", () => stopTimer());
 
     document.getElementById('reloadLabels').addEventListener('click', async () => {
       await loadLabelsFromCsv(LABELS_CSV_URL);
       renderDevList();
-      // clear all current layers/datasets because ID list might have changed
-      for (const id of [...markers.keys()]) clearDevice(id);
-      await start();
+      clearAll();
+      // keep mode
+      if(isLiveMode()) startLive().catch(console.error);
     });
 
-    devlist.addEventListener("change", () => {
-      (async () => {
-        await refreshSelectedHistory();
-        await tick();
-      })().catch(console.error);
-    });
-
-    document.getElementById("trail").addEventListener("change", () => {
-      if (!document.getElementById("trail").checked) {
-        for (const p of trails.values()) map.removeLayer(p);
-        trails.clear();
-      } else {
-        refreshSelectedHistory().catch(console.error);
+    document.getElementById('liveMode').addEventListener('change', () => {
+      updateAnchorUi();
+      if(isLiveMode()){
+        // switch to live
+        startLive().catch(console.error);
+      }else{
+        // switch to past
+        setAnchorNowIfEmpty();
+        renderPastAt(anchorUnix()).catch(console.error);
       }
     });
 
-    // ====== Init sequence ======
+    document.getElementById('applyPast').addEventListener('click', () => {
+      if(!isLiveMode()) renderPastAt(anchorUnix()).catch(console.error);
+    });
+
+    document.getElementById('anchorTime').addEventListener('change', () => {
+      if(!isLiveMode()) renderPastAt(anchorUnix()).catch(console.error);
+    });
+
+    document.getElementById("trail").addEventListener("change", () => {
+      // Re-render current view
+      if(isLiveMode()){
+        // just rebuild history line quickly
+        refreshSelectedHistoryLive().catch(console.error);
+      }else{
+        renderPastAt(anchorUnix()).catch(console.error);
+      }
+    });
+
+    // selection change
+    devlist.addEventListener("change", () => {
+      if(isLiveMode()){
+        (async () => { await refreshSelectedHistoryLive(); await tickLive(); })().catch(console.error);
+      }else{
+        renderPastAt(anchorUnix()).catch(console.error);
+      }
+    });
+
+    // ====== Init ======
     (async () => {
       await loadLabelsFromCsv(LABELS_CSV_URL);
       renderDevList();
-      start().catch(console.error);
+      updateAnchorUi();
+      setAnchorNowIfEmpty();
+      // start in live
+      startLive().catch(console.error);
     })();
   </script>
 </body>
