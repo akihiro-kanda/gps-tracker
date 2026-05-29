@@ -1,0 +1,679 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GPS Tracker (Polling + Historical Mode + Speed Chart)</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+
+    /* Layout: map + bottom chart */
+    #wrap { height: 100vh; display: flex; flex-direction: column; }
+    #map { flex: 1 1 auto; }
+    #chartWrap { height: 28vh; padding: 6px 8px; background: #fff; border-top: 1px solid #ddd; }
+    #speedChart { width: 100%; height: 100%; }
+
+    /* Control panel */
+    #panel {
+      position: absolute; top: 20px; right: 10px; z-index: 1000;
+      background: rgba(255,255,255,0.7);
+      padding: 10px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.2);
+      max-height: 80vh; overflow: auto;
+      min-width: 220px;
+      max-width: calc(92vw - 20px);
+    }
+
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .small { font-size: 12px; color: #444; }
+
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 10px; background: #eee; font-size: 12px; }
+    .ok { background: #d9f7d9; }
+    .ng { background: #ffd6d6; }
+
+    /* device list row (no grid) */
+    #devlist .devrow{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      margin: 3px 0;
+    }
+    #devlist label{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex: 1 1 auto;
+      min-width: 0;
+      white-space: nowrap;
+      font-size: 14px;
+    }
+
+    #devlist input[type=checkbox]{
+      transform: scale(1.05);
+    }
+
+    /* Permanent label over marker */
+    .id-label {
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      border-radius: 10px;
+      padding: 1px 6px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 0;
+      white-space: nowrap;
+    }
+
+    input[type=datetime-local] { font-size: 12px; padding: 2px 4px; }
+    input[type=number] { font-size: 12px; padding: 2px 4px; }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <div class="row">
+      <button id="start">開始</button>
+      <button id="stop">停止</button>
+      <label class="row"><input type="checkbox" id="trail" checked>軌跡</label>
+    </div>
+
+    <div class="row" style="margin-top:6px;">
+      <span class="small">ポーリング(S)</span>
+      <input id="poll" value="3" size="4" inputmode="numeric">
+      <span class="small">秒数</span>
+      <input id="trailPts" value="300" size="4" inputmode="numeric">
+    </div>
+
+    <div class="row" style="margin-top:6px;">
+      <label class="row" title="チェックON=現在モード(ポーリング) / OFF=過去モード(指定日時で固定)">
+        <input type="checkbox" id="liveMode" checked>
+        現在時刻基準
+      </label>
+    </div>
+
+    <div class="row" style="margin-top:4px;">
+      <span class="small">過去基準日時</span>
+      <input id="anchorTime" type="datetime-local" step="1">
+      <button id="applyPast">適用</button>
+    </div>
+
+    <div class="row" style="margin-top:6px;">
+      <button id="reloadLabels">labels.csv 再読み込み</button>
+      <span class="small" id="labelStatus">-</span>
+    </div>
+
+    <div class="small" style="margin-top:6px;">
+      表示選択（表示名は <b>labels.csv</b> ）
+    </div>
+    <hr>
+    <div id="devlist"></div>
+  </div>
+
+  <div id="wrap">
+    <div id="map"></div>
+    <div id="chartWrap">
+      <canvas id="speedChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+
+  <script>
+    // ====== API ======
+    const API_BASE = "https://fyx3533ssl.execute-api.us-east-1.amazonaws.com/prod";
+
+    // ====== Labels CSV (same folder as tracker.html) ======
+    const LABELS_CSV_URL = "./labels.csv";
+
+    // ====== Color per ID ======
+    const COLOR_PALETTE = [
+      "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
+      "#a65628", "#f781bf", "#999999", "#66c2a5", "#fc8d62",
+      "#8da0cb", "#e78ac3", "#a6d854", "#ffd92f", "#e5c494",
+      "#b3b3b3", "#1b9e77", "#d95f02", "#7570b3", "#e7298a"
+    ];
+    function colorForId(id){
+      return COLOR_PALETTE[(id - 1) % COLOR_PALETTE.length];
+    }
+
+    // ====== Labels (CSV only) ======
+    const labelMap = new Map(); // id -> label
+    const labelStatusEl = document.getElementById('labelStatus');
+
+    function displayName(id){
+      const s = labelMap.get(id);
+      return (s && s.trim().length) ? s.trim() : `ID ${id}`;
+    }
+
+    function escapeHtml(s){
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function getCsvIdsSorted(){
+      return [...labelMap.keys()].sort((a,b) => a - b);
+    }
+
+    async function loadLabelsFromCsv(url){
+      labelMap.clear();
+      labelStatusEl.textContent = 'labels.csv 読込中...';
+      try{
+        const r = await fetch(url, { cache: 'no-store' });
+        if(!r.ok) throw new Error(`HTTP ${r.status}`);
+        let text = await r.text();
+        text = text.replace(/^\uFEFF/, '');
+
+        const lines = text.split(/\r?\n/).map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+        if(lines.length === 0){
+          labelStatusEl.textContent = 'labels.csv 空';
+          return;
+        }
+
+        let start = 0;
+        if(/device_id/i.test(lines[0]) && /label/i.test(lines[0])) start = 1;
+
+        let count = 0;
+        for(let i=start;i<lines.length;i++){
+          const parts = lines[i].split(',');
+          if(parts.length < 2) continue;
+          const id = Number(parts[0].trim());
+          const label = parts.slice(1).join(',').trim();
+          if(!Number.isFinite(id) || id <= 0) continue;
+          if(!label) continue;
+          labelMap.set(id, label);
+          count++;
+        }
+        labelStatusEl.textContent = `labels.csv ${count}件`;
+      }catch(e){
+        console.warn('labels.csv load failed', e);
+        labelStatusEl.textContent = 'labels.csv 読込失敗';
+      }
+    }
+
+    // ====== Leaflet Map ======
+    const map = L.map('map').setView([34.70, 137.72], 14);
+    setTimeout(() => map.invalidateSize(), 0);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // ====== State ======
+    const markers = new Map(); // id -> circleMarker
+    const trails  = new Map(); // id -> polyline
+    const lastTs  = new Map(); // id -> last timestamp we processed (UNIX sec)
+
+    const e7toDeg = (v) => v / 1e7;
+
+    // ====== Speed chart (Chart.js) ======
+    const chartCtx = document.getElementById("speedChart");
+    const speedChart = new Chart(chartCtx, {
+      type: "line",
+      data: { datasets: [] },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        parsing: false,
+        scales: {
+          x: {
+            type: "linear",
+            title: { display: true, text: "Time" },
+            ticks: {
+              callback: (v) => {
+                const d = new Date(Number(v) * 1000);
+                return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+              }
+            }
+          },
+          y: {
+//            title: { display: true, text: "Speed (km/h)" },
+            title: { display: true, text: "RSSI" },
+            beginAtZero: true
+          }
+        },
+        plugins: {
+          legend: { display: true }
+        }
+      }
+    });
+
+    function findDatasetIndex(id) {
+      return speedChart.data.datasets.findIndex(ds => ds._deviceId === id);
+    }
+
+    function ensureDataset(id) {
+      const idx = findDatasetIndex(id);
+      if (idx >= 0) return;
+      const color = colorForId(id);
+      speedChart.data.datasets.push({
+        _deviceId: id,
+        label: displayName(id),
+        data: [],
+        borderColor: color,
+        backgroundColor: color,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.15
+      });
+    }
+
+    function removeDataset(id) {
+      const idx = findDatasetIndex(id);
+      if (idx >= 0) {
+        speedChart.data.datasets.splice(idx, 1);
+        speedChart.update();
+      }
+    }
+
+    function setDatasetData(id, points, maxPts) {
+      ensureDataset(id);
+      const idx = findDatasetIndex(id);
+      speedChart.data.datasets[idx].label = displayName(id);
+      speedChart.data.datasets[idx].data = points.slice(-maxPts);
+    }
+
+    function appendDatasetPoint(id, ts, speed_cms, maxPts) {
+      ensureDataset(id);
+      const idx = findDatasetIndex(id);
+      const ds = speedChart.data.datasets[idx];
+      ds.label = displayName(id);
+//      const kmh = (speed_cms/100)*3.6;
+      const kmh = speed_cms;
+      const last = ds.data.length ? ds.data[ds.data.length - 1] : null;
+      if (!last || ts > last.x) {
+        ds.data.push({ x: ts, y: kmh });
+        while (ds.data.length > maxPts) ds.data.shift();
+      }
+    }
+
+    // ====== Device list (from CSV only) ======
+    const devlist = document.getElementById("devlist");
+
+    function renderDevList(){
+      devlist.innerHTML = '';
+      const ids = getCsvIdsSorted();
+      if(ids.length === 0){
+        const div = document.createElement('div');
+        div.className = 'small';
+        div.textContent = 'labels.csv にIDがありません';
+        devlist.appendChild(div);
+        return;
+      }
+      for (const id of ids) {
+        const div = document.createElement("div");
+        div.className = "devrow";
+        div.innerHTML = `
+          <label>
+            <input type="checkbox" data-id="${id}">
+            ${escapeHtml(displayName(id))}
+          </label>
+          <span class="badge ng" id="status-${id}">unknown</span>
+        `;
+        devlist.appendChild(div);
+      }
+    }
+
+    function selectedIds() {
+      return [...document.querySelectorAll("#devlist input[type=checkbox]")]
+        .filter(x => x.checked)
+        .map(x => Number(x.dataset.id));
+    }
+
+    function setStatus(id, ok) {
+      const el = document.getElementById(`status-${id}`);
+      if (!el) return;
+      if (ok) { el.textContent = "found"; el.className = "badge ok"; }
+      else    { el.textContent = "none";  el.className = "badge ng"; }
+    }
+
+    // ====== API calls ======
+    async function fetchLatest(ids) {
+      const url = `${API_BASE}/latest?ids=${encodeURIComponent(ids.join(","))}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("latest fetch failed");
+      return await r.json();
+    }
+
+    // history supports optional to=UNIXsec (anchor), and returns items in ascending order (old->new)
+    async function fetchHistory(deviceId, limit, toUnix=null) {
+      const params = new URLSearchParams();
+      params.set('device_id', deviceId);
+      params.set('limit', limit);
+      if (toUnix !== null) params.set('to', toUnix);
+      const url = `${API_BASE}/history?${params.toString()}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("history fetch failed");
+      return await r.json();
+    }
+
+    // ====== Map drawing ======
+    function upsertMarkerFromPoint(id, p) {
+      const ll = [e7toDeg(p.lat), e7toDeg(p.lon)];
+      const color = colorForId(id);
+
+      let m = markers.get(id);
+      if (!m) {
+        m = L.circleMarker(ll, {
+          radius: 7,
+          color: color,
+          weight: 2,
+          fillColor: color,
+          fillOpacity: 0.9
+        }).addTo(map);
+
+        m.bindTooltip(displayName(id), {
+          permanent: true,
+          direction: "top",
+          offset: [0, -8],
+          className: "id-label"
+        });
+
+        markers.set(id, m);
+      } else {
+        m.setLatLng(ll);
+        if(m.getTooltip && m.getTooltip()) m.setTooltipContent(displayName(id));
+      }
+
+      const kmh = (p.speed/100*3.6).toFixed(1);
+      m.bindPopup(
+        `${displayName(id)}<br>` +
+        `ts:${p.timestamp}<br>` +
+        `spd:${kmh} km/h<br>` +
+        `rssi:${p.rssi}<br>` +
+        `gw:${p.gw ?? ""}`
+      );
+
+      return ll;
+    }
+
+    function setTrailFromHistory(id, items) {
+      const color = colorForId(id);
+      const pts = items.map(it => [e7toDeg(it.lat), e7toDeg(it.lon)]);
+
+      const old = trails.get(id);
+      if (old) {
+        map.removeLayer(old);
+        trails.delete(id);
+      }
+
+      const pl = L.polyline(pts, {
+        color,
+        weight: 6,
+        opacity: 1.0,
+        lineJoin: "round",
+        lineCap: "round"
+      }).addTo(map);
+
+      pl.bringToFront();
+      trails.set(id, pl);
+    }
+
+    function appendTrailPoint(id, ll, maxPts) {
+      const color = colorForId(id);
+      let pl = trails.get(id);
+      if (!pl) {
+        pl = L.polyline([ll], { color, weight: 4, opacity: 0.85 }).addTo(map);
+        trails.set(id, pl);
+        return;
+      }
+      const pts = pl.getLatLngs();
+      pts.push(L.latLng(ll[0], ll[1]));
+      while (pts.length > maxPts) pts.shift();
+      pl.setLatLngs(pts);
+      pl.setStyle({ color, weight: 4, opacity: 0.85 });
+    }
+
+    function clearDevice(id) {
+      const m = markers.get(id);
+      if (m) { map.removeLayer(m); markers.delete(id); }
+      const p = trails.get(id);
+      if (p) { map.removeLayer(p); trails.delete(id); }
+      lastTs.delete(id);
+      setStatus(id, false);
+      removeDataset(id);
+    }
+
+    function clearAll(){
+      for (const id of [...markers.keys()]) clearDevice(id);
+      // chart datasets are removed by clearDevice via removeDataset
+      // also clear any remaining datasets
+      speedChart.data.datasets = [];
+      speedChart.update();
+    }
+
+    // ====== Modes ======
+    let timer = null;
+
+    function isLiveMode(){
+      return document.getElementById('liveMode').checked;
+    }
+
+    function anchorUnix(){
+      const s = document.getElementById('anchorTime').value;
+      if(!s) return null;
+      const d = new Date(s);
+      if(Number.isNaN(d.getTime())) return null;
+      return Math.floor(d.getTime()/1000);
+    }
+
+    function setAnchorNowIfEmpty(){
+      const el = document.getElementById('anchorTime');
+      if(el.value) return;
+      const d = new Date();
+      // datetime-local expects local time, format YYYY-MM-DDTHH:MM:SS
+      const pad = (n)=> String(n).padStart(2,'0');
+      const v = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+      el.value = v;
+    }
+
+    function updateAnchorUi(){
+      const live = isLiveMode();
+      document.getElementById('anchorTime').disabled = live;
+      document.getElementById('applyPast').disabled = live;
+    }
+
+    // ====== Live mode: latest polling + history initial ======
+    async function refreshSelectedHistoryLive() {
+      const ids = selectedIds();
+      const trailOn = document.getElementById("trail").checked;
+      const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
+
+      // Remove unchecked
+      for (const id of [...markers.keys()]) {
+        if (!ids.includes(id)) clearDevice(id);
+      }
+      for (const ds of [...speedChart.data.datasets]) {
+        if (!ids.includes(ds._deviceId)) removeDataset(ds._deviceId);
+      }
+
+      for (const id of ids) {
+        const hist = await fetchHistory(id, maxPts, null);
+        const items = hist.items || [];
+        if(items.length === 0){
+          setStatus(id, false);
+          continue;
+        }
+        setStatus(id, true);
+        if(trailOn && items.length > 1) setTrailFromHistory(id, items);
+//        setDatasetData(id, items.map(p => ({x:p.timestamp, y:(p.speed/100)*3.6})), maxPts);
+        setDatasetData(id, items.map(p => ({x:p.timestamp, y:p.rssi})), maxPts);
+        lastTs.set(id, items[items.length-1].timestamp);
+      }
+
+      speedChart.update();
+      setTimeout(() => map.invalidateSize(), 0);
+    }
+
+    async function tickLive(){
+      const ids = selectedIds();
+      if (ids.length === 0) return;
+
+      const trailOn = document.getElementById("trail").checked;
+      const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
+
+      const latest = await fetchLatest(ids);
+
+      for (const p of latest.items) {
+        const id = p.device_id;
+        if (!p.found) {
+          setStatus(id, false);
+          if (markers.has(id) || trails.has(id) || findDatasetIndex(id) >= 0) clearDevice(id);
+          continue;
+        }
+
+        setStatus(id, true);
+        const prevTs = lastTs.get(id);
+        const ll = upsertMarkerFromPoint(id, p);
+
+        if (trailOn && (!prevTs || p.timestamp > prevTs)) {
+          appendTrailPoint(id, ll, maxPts);
+        }
+
+        if (!prevTs || p.timestamp > prevTs) {
+//          appendDatasetPoint(id, p.timestamp, p.speed, maxPts);
+          appendDatasetPoint(id, p.timestamp, p.rssi, maxPts);
+        }
+
+        lastTs.set(id, p.timestamp);
+      }
+
+      speedChart.update('none');
+
+      // Remove unchecked
+      for (const id of [...markers.keys()]) {
+        if (!ids.includes(id)) clearDevice(id);
+      }
+    }
+
+    async function startLive(){
+      stopTimer();
+      await refreshSelectedHistoryLive();
+      await tickLive();
+      const pollS = Number(document.getElementById("poll").value) || 3;
+      timer = setInterval(() => tickLive().catch(console.error), pollS * 1000);
+    }
+
+    // ====== Past mode: fixed at anchor time ======
+    async function renderPastAt(anchor){
+      stopTimer();
+      clearAll();
+
+      const ids = selectedIds();
+      const trailOn = document.getElementById("trail").checked;
+      const maxPts = Math.min(Number(document.getElementById("trailPts").value) || 300, 2000);
+
+      if(ids.length === 0) return;
+      if(anchor === null){
+        alert('過去表示の日時を入力してください');
+        return;
+      }
+
+      for (const id of ids) {
+        const hist = await fetchHistory(id, maxPts, anchor);
+        const items = hist.items || [];
+        if(items.length === 0){
+          setStatus(id, false);
+          continue;
+        }
+        setStatus(id, true);
+
+        // trail from history (already old->new)
+        if(trailOn && items.length > 1) setTrailFromHistory(id, items);
+
+        // marker at last point (closest to anchor)
+        const last = items[items.length - 1];
+        upsertMarkerFromPoint(id, last);
+
+        // chart
+//        setDatasetData(id, items.map(p => ({x:p.timestamp, y:(p.speed/100)*3.6})), maxPts);
+        setDatasetData(id, items.map(p => ({x:p.timestamp, y:p.rssi})), maxPts);
+
+        lastTs.set(id, last.timestamp);
+      }
+
+      speedChart.update();
+      setTimeout(() => map.invalidateSize(), 0);
+    }
+
+    function stopTimer(){
+      if(timer) clearInterval(timer);
+      timer = null;
+    }
+
+    // ====== Event wiring ======
+    document.getElementById("start").addEventListener("click", () => {
+      if(isLiveMode()) startLive().catch(console.error);
+      else renderPastAt(anchorUnix()).catch(console.error);
+    });
+    document.getElementById("stop").addEventListener("click", () => stopTimer());
+
+    document.getElementById('reloadLabels').addEventListener('click', async () => {
+      await loadLabelsFromCsv(LABELS_CSV_URL);
+      renderDevList();
+      clearAll();
+      // keep mode
+      if(isLiveMode()) startLive().catch(console.error);
+    });
+
+    document.getElementById('liveMode').addEventListener('change', () => {
+      updateAnchorUi();
+      if(isLiveMode()){
+        // switch to live
+        startLive().catch(console.error);
+      }else{
+        // switch to past
+        setAnchorNowIfEmpty();
+        renderPastAt(anchorUnix()).catch(console.error);
+      }
+    });
+
+    document.getElementById('applyPast').addEventListener('click', () => {
+      if(!isLiveMode()) renderPastAt(anchorUnix()).catch(console.error);
+    });
+
+    document.getElementById('anchorTime').addEventListener('change', () => {
+      if(!isLiveMode()) renderPastAt(anchorUnix()).catch(console.error);
+    });
+
+    document.getElementById("trail").addEventListener("change", () => {
+      // Re-render current view
+      if(isLiveMode()){
+        // just rebuild history line quickly
+        refreshSelectedHistoryLive().catch(console.error);
+      }else{
+        renderPastAt(anchorUnix()).catch(console.error);
+      }
+    });
+
+    // selection change
+    devlist.addEventListener("change", () => {
+      if(isLiveMode()){
+        (async () => { await refreshSelectedHistoryLive(); await tickLive(); })().catch(console.error);
+      }else{
+        renderPastAt(anchorUnix()).catch(console.error);
+      }
+    });
+
+    // ====== Init ======
+    (async () => {
+      await loadLabelsFromCsv(LABELS_CSV_URL);
+      renderDevList();
+      updateAnchorUi();
+      setAnchorNowIfEmpty();
+      // start in live
+      startLive().catch(console.error);
+    })();
+  </script>
+</body>
+</html>
