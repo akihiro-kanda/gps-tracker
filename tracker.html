@@ -287,7 +287,7 @@
       const idx = findDatasetIndex(id);
       const ds = speedChart.data.datasets[idx];
       ds.label = displayName(id);
-      const kmh = (speed_cms/100)*3.6;
+      const kmh = speed_cms;
       const last = ds.data.length ? ds.data[ds.data.length - 1] : null;
       if (!last || ts > last.x) {
         ds.data.push({ x: ts, y: kmh });
