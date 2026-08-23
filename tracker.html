@@ -504,7 +504,7 @@
         }
         setStatus(id, true);
         if(trailOn && items.length > 1) setTrailFromHistory(id, items);
-        setDatasetData(id, items.map(p => ({x:p.timestamp, y:(p.speed/100)*3.6})), maxPts);
+        setDatasetData(id, items.map(p => ({x:p.timestamp, y:p.speed})), maxPts);
         lastTs.set(id, items[items.length-1].timestamp);
       }
 
@@ -592,7 +592,7 @@
         upsertMarkerFromPoint(id, last);
 
         // chart
-        setDatasetData(id, items.map(p => ({x:p.timestamp, y:(p.speed/100)*3.6})), maxPts);
+        setDatasetData(id, items.map(p => ({x:p.timestamp, y:p.speed})), maxPts);
 
         lastTs.set(id, last.timestamp);
       }
