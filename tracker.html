@@ -383,7 +383,7 @@
         if(m.getTooltip && m.getTooltip()) m.setTooltipContent(displayName(id));
       }
 
-      const kmh = (p.speed/100*3.6).toFixed(1);
+      const kmh = p.speed.toFixed(1);
       m.bindPopup(
         `${displayName(id)}<br>` +
         `ts:${p.timestamp}<br>` +
